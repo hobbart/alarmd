@@ -1,2 +1,2 @@
 # alarmd
-Alarm system on Raspbery Pi
+Alarm system daemon on Raspbery Pi

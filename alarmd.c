@@ -649,14 +649,14 @@ while(1) { //nicht-blockierendes, hot-plug fähiges Auslesen des USB RFID-Reader
        rfid_tag=0; //Falls Fehler beim Lesen, RFID-Tag auf 0 setzen
     }
     else {
-        syslog(LOG_NOTICE, "RFID-Tag gelesen, Tag-Nr: %010d",rfid_tag);
         j=9; //Zähler für 10-stellige Tag-Nr. initialisieren
         rfid_tag=0; //Tag-Nr. auf 0 (Unbekannt) initialisieren
         rfid_nr=0; //RFID Listen-Nummer auf 0 "Unbekannt" initialisieren
         for (i = 2; i < 160; i=i+16) {
            rfid_tag=rfid_tag+(pow(10,j)*((buf[i]-29)%10)); //RFID-Tag Nummer dekodieren
            j=j-1;
-       }
+        }
+        syslog(LOG_NOTICE, "RFID-Tag gelesen, Tag-Nr: %010d",rfid_tag);
     }
     res=fclose(fd_rfid); // /dev/hidraw0 schliessen
     if (res != 0) { perror("Fehler beim Schliessen von /dev/hidraw0"); exit(1); }

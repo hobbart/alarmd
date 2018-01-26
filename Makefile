@@ -2,8 +2,8 @@
 #   Makefile fuer alarmd
 #
 
-alarmd_21: alarmd_21.c
-	gcc -Wall -pthread -lm alarmd_21.c gpiolib.c -o alarmd_21 -L.. libiniparser.a
+alarmd_23: alarmd_23.c
+	gcc -Wall -pthread -lm alarmd_23.c gpiolib.c -o alarmd_23 -L.. libiniparser.a
 
 parse: parse.c
 	gcc -lm parse.c -o parse -L.. libiniparser.a

@@ -1,5 +1,5 @@
-//*************************************************************************************
-// alarmd_23.c
+//*************************************************
+// alarmd_17.c
 //
 // Meine Alarmanlage :-)
 // ---------------------
@@ -29,26 +29,10 @@
 // Prozess-Name von Kind-Prozess (RFID-Daemon) auf "rfidd" gesetzt
 // Label für syslog-Einträge aus Kind-Prozess (RFID-Daemon) auf "rfidd" gesetzt
 // V0.15 Ausgabe Blitzlicht, Sirene und Flurlicht-Schaltung über GPIO und Relaisplatine
-// V0.16 PIR-Sensoren Abfrage mit Flankendetektion, 8sec-timeout, separate Threads und Signalisierung über Variable pir_flag
+// V0.16 PIR-Sensoren Abfrage mit Flankendetektion, 8sec-timeout, separater Thread und Signalisierung über SIGUSR2
 // V0.17 Geändert: rfidd als Thread, keine Signale, kein IPC-Mem, main-Endlosschleife anpassen
-// V0.18 kleinere Fehler bereinigt, Sensoren wieder eingepflegt
-// LED_OK, LED_ACTIVE, LED_ALARM Ausgabe mit separaten Threads über GPIO
-// V0.19 BUGFIX: Syslog-Eintrag für Aufwärmphase, Ausgabe von Sensornummern statt GPIO-Pins
-// Flurlichtschaltung als Impuls, CTRL-C Handler für Beendigung der Hauptschleife
-// durch Setzen der Schleifenvariable auf 0, Aufräumen in Funktion cleanup() mit
-// Syslog-Eintrag, GPIO und Kamera-Deaktivierung, Beendigung aller laufenden Threads
-// sowie reguläre Programmbeendigung bei Abbruch mit CTRL-C oder killall-Befehl
-// V0.20 bei Initialisierung der State-Machine direkt nach Zustand "Ein" springen
-// V0.21 BUGFIX: bei Start Alarm-Countdown Sensor-Nummer im Syslog mit ausgeben
-// bei Alarm-Abbruch mit richtigem RFID-Tag #9 Kameras und alle Relais abschalten
-// in State-Machine Übergang #7 Bedingung pir_flag=1 gelöscht
-// in State-Machine Übergang #11 hinzugefügt: sofortige Alarm-Aktivierung bei
-// Auflegen von falschem RFID-Tag im Zustand "Anlage ein"
-// in State-Machine Übergänge #5, #7 rfid_bad=1 gelöscht
-// V0.22 BUGFIX: GPIO-Eingänge als Pegel-aktiv konfigurieren (nicht mehr Flanken-aktiv, da zu störempfindlich)
-// 2x malige Abfrage der Sensoren mit 200ms Watezeit zwischen den Abfragen zur Vermeidung von Fehlalarm durch transiente Störimpluse
-// V0.23 Hardware-Watchdog (/dev/watchdog) in Hauptschleife
-//*************************************************************************************
+//
+//*************************************************
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,7 +41,6 @@
 #include <time.h>
 #include <pthread.h>
 #include <linux/hidraw.h>
-#include <linux/watchdog.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -82,7 +65,6 @@
 //**************************************************
 //Funktionsdeklarationen
 //**************************************************
-void ctrl_c_handler(int signal);
 void syslog_init();
 void config_init();
 void memory_init();
@@ -106,11 +88,6 @@ void flurlicht_aus();
 void start_threads();
 void *pir_read(void *threadid);
 void *rfidd();
-void *led_out();
-void cleanup();
-void start_watchdog();
-void stop_watchdog();
-void ping_watchdog();
 //**************************************************
 //Globale Variablen
 //**************************************************
@@ -137,9 +114,7 @@ int sw_blitzlicht; //Schalter für Blitzlicht
 int sw_sirene; //Schalter für Sirene & Blitzlicht
 int sw_flurlicht; //Schalter für Flurlicht
 int sensor_anzahl; //Anzahl installierter Sensoren
-int sensor_warmup; //Aufwärmzeit für PIR-Sensoren (default 60sec)
 //Initialisierung hier
-int run = 1; //Schleifenvariable der Hauptschleife
 char config_file[20]="/etc/alarmd.conf"; //Config-File
 char child_proc_name[]="rfidd"; //Name von Kind-Prozess
 dictionary *config; //Struktur für alle geparsten Config-Einträge
@@ -152,17 +127,14 @@ char buf[176]; //Buffer für RFID-Reader
 int sensor_rfid=256; //virtuelle Sensor-Nummer für Alarmaktivierung durch falsches RFID-Tag
 int i, j, res = 0;
 pid_t ppid; //Prozess-ID Elternprozess
-pthread_t sensor_thread[256], rfidd_thread, led_thread; //Thread-Identifier Array (opaque, IEEE POSIX 1003.1c standard)
+pthread_t pir_thread[256], rfidd_thread; //Thread-Identifier Array (opaque, IEEE POSIX 1003.1c standard)
 int watchdog_zaehler = 0; //Watchdog-Zähler für Syslog-Eintrag
-int wd_file; //Filehandle für Hardware-Watchdog
-char wd_device[]="/dev/watchdog"; //Hardware-Watchdog Device
-int countdown; //Countdown für Betreten/Verlassen der Wohnung und Alarmdauer
-int led_freq=4; //LED Blinkfrequenz in Hz
-int led_ok_status, led_active_status, led_alarm_status; //Zustand der LEDs: 0=aus, 1=an, 2=blinkt
+int countdown; //Countdown für Betreten und Verlassen der Wohnung
+int pir_warmup = 0; //60sec Aufwärmzeit für PIR-Sensoren
 int help_text_zeilen = 6; //Anzahl der Zeilen für Hilfetext
 char help_text[][100]={
 "Aufruf: alarmd [OPTION]",
-"Version 0.23",
+"Version 0.17",
 "",
 "Optionen:",
 "-s	Aktiviere Simulationsmodus",
@@ -180,7 +152,6 @@ int rfid_tag;      //dekodierter RFID-Tag
 int rfid_nr;       //Laufende Nummer in Personenliste für RFID-Tag
 int rfid_good;     //RFID-Tag in Liste? 0=nein, 1=ja
 int rfid_bad;      //RFID-Tag nicht in Liste? 0=nein, 1=ja
-int pir_flag;      //PIR-Sensor aktiviert? 0=nein, 1=ja
 
 //**************************************************
 //Hauptprogramm
@@ -189,36 +160,22 @@ int main(int argc, char *argv[])
 {
 //Allgemeine Initialisierungen
 syslog_init(); //Syslog initialisieren
-syslog(LOG_NOTICE, "Alarm-Daemon gestartet"); //Syslog-Eintrag
 ppid=getpid(); //Prozess-ID des Hauptprozesses ermitteln
-signal(SIGINT, ctrl_c_handler); //Signalhandler für CTRL-C initialisieren
+syslog(LOG_NOTICE, "Alarm-Daemon gestartet"); //Syslog-Eintrag
 config_init(); //Variablen-Initialisierung aus Config-Datei
 check_options(argc, argv); //Parameterübergabe an main auswerten
-check_alarmd_task(); //Test ob schon ein alarmd-Task läuft-->Info-->exit(100)
+check_alarmd_task(); //Test ob schon ein alarmd-Task läuft -->Info-->exit(100)
 //Anlagen-Initialisierung
-led_ok_status=2; //grüne LED blinkt = Anlagen-Initialisierung
 hardware_init(); //Hardware-Initialisierung (GPIO, Kameras)
 status_init(); //Anlagenstatus initialisieren (Zustand vor Neustart)
 start_threads(); //Threads erzeugen und starten
-start_watchdog(); //Hardware-Watchdog starten
 
-//   #0 Initialisierung der State-Machine
-  led_ok_status=1; //grüne LED ein = Software läuft
-  if(anlage_status[0]) { //falls Anlage eingeschaltet war --> wieder einschalten
-  anlage_status[0]=0; //bei Zustand "Anlage aus" starten
-  anlage_countdown[0]=1; //Einschalt-Countdown läuft
-  countdown=0; //und ist gerade beendet
-  }
-
-  while(run) { //Hauptprogramm in Endlosschleife wird jede Sekunde 1x aufgerufen
+  while(1) { //Hauptprogramm in Endlosschleife wird jede Sekunde 1x aufgerufen
 //   #1 wenn Anlage erstmalig aktiviert wird
 if(!anlage_status[0] && !anlage_countdown[0] && !alarm_status[0] && !alarm_countdown[0] && rfid_good) {
         anlage_countdown[1]=1; //neuen Anlagenzustand schreiben
         countdown=einschalt_verzoegerung; //Einschalt-Countdown starten
         rfid_good=0; //Trigger löschen
-        led_ok_status=1; //grüne LED ein
-        led_active_status=2; //gelbe LED blinkt
-        led_alarm_status=0; //rote LED aus
         syslog(LOG_NOTICE, "Einschalt-Countdown gestartet"); //Syslog-Eintrag
      }
 //   #2 Einschalt-Countdown abbrechen
@@ -226,9 +183,6 @@ if(!anlage_status[0] && anlage_countdown[0] && !alarm_status[0] && !alarm_countd
         anlage_status[1]=0; //Anlage deaktivieren
         anlage_countdown[1]=0; //Anlagen-Countdown abschalten
         rfid_good=0; //Trigger löschen
-        led_ok_status=1; //grüne LED ein
-        led_active_status=0; //gelbe LED aus
-        led_alarm_status=0; //rote LED aus
         //countdown=0; //Zaehler rücksetzen problem mit #3
         syslog(LOG_NOTICE, "Einschalt-Countdown abgebrochen"); //Syslog-Eintrag
      }
@@ -238,9 +192,6 @@ if(!anlage_status[0] && anlage_countdown[0] && !alarm_status[0] && !alarm_countd
         anlage_countdown[1]=0; //Countdown abschalten
         alarm_status[1]=0; //alle Alarme löschen
         alarm_countdown[1]=0; //Alarm-Countdown abschalten
-        led_ok_status=1; //grüne LED ein
-        led_active_status=1; //gelbe LED ein
-        led_alarm_status=0; //rote LED aus
         syslog(LOG_NOTICE, "Anlage aktiviert, RFID-Tag: %010d, Name: %s",rfid_tag,personen[rfid_nr]); //Syslog-Eintrag
         status_write(); //aktuellen Anlagenstatus auf Disk speichern
      }
@@ -248,40 +199,28 @@ if(!anlage_status[0] && anlage_countdown[0] && !alarm_status[0] && !alarm_countd
 if(anlage_status[0] && !anlage_countdown[0] && !alarm_status[0] && !alarm_countdown[0] && rfid_good) {
         anlage_status[1]=0; //Anlage deaktivieren
         rfid_good=0; //Trigger löschen
-        led_ok_status=1; //grüne LED ein
-        led_active_status=0; //gelbe LED aus
-        led_alarm_status=0; //rote LED aus
         syslog(LOG_NOTICE, "Anlage deaktiviert, RFID-Tag: %010d, Name: %s",rfid_tag,personen[rfid_nr]); //Syslog-Eintrag
         status_write(); //aktuellen Anlagenstatus auf Disk speichern
      }
-//   #5 wenn Alarm erstmalig von PIR-Sensor aktiviert wird
-if(anlage_status[0] && !anlage_countdown[0] && !alarm_status[0] && !alarm_countdown[0] && pir_flag) {
+//   #5 wenn Alarm erstmalig aktiviert wird
+if(anlage_status[0] && !anlage_countdown[0] && !alarm_status[0] && !alarm_countdown[0] && rfid_bad) {
         alarm_countdown[1]=1; //neuen Anlgenzustand schreiben
         countdown=alarm_verzoegerung; //Alarm-Countdown starten
-        pir_flag=0; //Trigger löschen
-        led_ok_status=1; //grüne LED ein
-        led_active_status=1; //gelbe LED ein
-        led_alarm_status=2; //rote LED blinkt
-        syslog(LOG_NOTICE, "Alarm-Countdown gestartet, Sensor: %d",alarm_sensor); //Syslog-Eintrag
+        rfid_bad=0; //Trigger löschen
+        syslog(LOG_NOTICE, "Alarm-Countdown gestartet"); //Syslog-Eintrag
      }
 //   #6 Alarm-Countdown abbrechen und Anlage ausschalten
 if(anlage_status[0] && !anlage_countdown[0] && !alarm_status[0] && alarm_countdown[0] && rfid_good) {
         anlage_status[1]=0;  //Anlage deaktivieren
         alarm_countdown[1]=0; //Countdown abschalten
         rfid_good=0; //Trigger löschen
-        led_ok_status=1; //grüne LED ein
-        led_active_status=0; //gelbe LED aus
-        led_alarm_status=0; //rote LED aus
         syslog(LOG_NOTICE, "Alarm-Countdown gestoppt"); //Syslog-Eintrag
      }
-//   #7 Alarm-Countdown auf 0
-if(anlage_status[0] && !anlage_countdown[0] && !alarm_status[0] && alarm_countdown[0] && countdown==0) {
+//   #7 Alarm-Countdown auf 0 ODER erneut falsches RFID-Tag gelesen
+if(anlage_status[0] && !anlage_countdown[0] && !alarm_status[0] && alarm_countdown[0] && (countdown==0 || rfid_bad)) {
         alarm_status[1]++; //Alarm-Status hochzählen
         alarm_countdown[1]=0; //Alarm-Countdown abschalten
-        pir_flag=0; //Trigger löschen
-        led_ok_status=1; //grüne LED ein
-        led_active_status=1; //gelbe LED ein
-        led_alarm_status=1; //rote LED ein
+        rfid_bad=0; //Trigger löschen
         countdown=alarm_dauer; //Countdown für Alarm-Dauer starten
         syslog(LOG_NOTICE, "Alarm aktiviert, Sensor: %d",alarm_sensor); //Syslog-Eintrag
         start_cam(); //Kameraaufnahme starten
@@ -298,9 +237,6 @@ if(anlage_status[0] && !anlage_countdown[0] && !alarm_status[0] && alarm_countdo
 //   #8 Alarmzeit abgelaufen Alarm wird deaktiviert
      if(anlage_status[0] && !anlage_countdown[0] && alarm_status[0] && !alarm_countdown[0] && countdown==0) {
         alarm_status[1]=0; //Alarm deaktivieren
-        led_ok_status=1; //grüne LED ein
-        led_active_status=1; //gelbe LED ein
-        led_alarm_status=0; //rote LED aus
         syslog(LOG_NOTICE, "Alarm deaktiviert"); //Syslog-Eintrag
         stop_cam(); //Kameraaufnahme stoppen
         syslog(LOG_NOTICE, "Kameras gestoppt"); //Syslog-Eintrag
@@ -315,58 +251,21 @@ if(anlage_status[0] && !anlage_countdown[0] && !alarm_status[0] && alarm_countdo
         alarm_status[1]=0; //Alarm deaktivieren
         alarm_countdown[1]=0; //Alarm-Countdown deaktivieren
         rfid_good=0; //Trigger löschen
-        led_ok_status=1; //grüne LED ein
-        led_active_status=0; //gelbe LED aus
-        led_alarm_status=0; //rote LED aus
         sprintf(text,"Alarm & Anlage mit RFID deaktiviert, Name: %s, Zeit: %s",personen[rfid_nr],ctime(&alarm_zeit));
-        syslog(LOG_NOTICE, "Alarm & Anlage deaktiviert, RFID-Tag: %010d, Name: %s",rfid_tag,personen[rfid_nr]); //Syslog-Eintrag
         if (sw_sms) send_sms(text); //Deaktivierungs-SMS verschicken
         if (sw_sms) syslog(LOG_NOTICE, "Deaktivierungs-SMS gesendet"); //Syslog-Eintrag
         if (sw_email) send_email(text); //Deaktivierungs-Email verschicken
         if (sw_email) syslog(LOG_NOTICE, "Deaktivierungs-Email gesendet"); //Syslog-Eintrag
-        stop_cam(); //Kameraaufnahme stoppen
-        syslog(LOG_NOTICE, "Kameras gestoppt"); //Syslog-Eintrag
-        if (sw_blitzlicht) blitzlicht_aus(); //Blitzlicht ausschalten
-        if (sw_sirene) sirene_aus(); //Sirene ausschalten
-        if (sw_flurlicht) flurlicht_aus(); //Flurlicht ausschalten
-        status_write(); //aktuellen Anlagenstatus auf Disk speichern
      }
 //   #10 laufender Alarm wird reaktiviert
-     if(anlage_status[0] && !anlage_countdown[0] && alarm_status[0] && !alarm_countdown[0] && (rfid_bad || pir_flag)) {
+     if(anlage_status[0] && !anlage_countdown[0] && alarm_status[0] && !alarm_countdown[0] && rfid_bad) {
         alarm_status[1]++; //Alarm-Status hochzählen
         countdown=alarm_dauer; //erneut Countdown für Alarm-Dauer starten
         rfid_bad=0; //Trigger löschen
-        pir_flag=0; //Trigger löschen
-        led_ok_status=1; //grüne LED ein
-        led_active_status=1; //gelbe LED ein
-        led_alarm_status=1; //rote LED ein
         syslog(LOG_NOTICE, "Alarm reaktiviert, Sensor: %d, Alarm-Anzahl: %d",alarm_sensor,alarm_status[1]); //Syslog-Eintrag
-     }
-//   #11 sofortige Alarm-Aktivierung aus Zustand "Anlage ein" mit falschem RFID-Tag
-if(anlage_status[0] && !anlage_countdown[0] && !alarm_status[0] && rfid_bad) {
-        alarm_status[1]++; //Alarm-Status hochzählen
-        alarm_countdown[1]=0; //Alarm-Countdown abschalten
-        rfid_bad=0; //Trigger löschen
-        pir_flag=0; //Trigger löschen
-        led_ok_status=1; //grüne LED ein
-        led_active_status=1; //gelbe LED ein
-        led_alarm_status=1; //rote LED ein
-        countdown=alarm_dauer; //Countdown für Alarm-Dauer starten
-        syslog(LOG_NOTICE, "Alarm aktiviert, Sensor: %d",alarm_sensor); //Syslog-Eintrag
-        start_cam(); //Kameraaufnahme starten
-        syslog(LOG_NOTICE, "Kameras gestartet"); //Syslog-Eintrag
-        sprintf(text,"ALARM! Zeit: %s Sensor: %d",ctime(&alarm_zeit),alarm_sensor);
-        if (sw_sms) send_sms(text); //Alarm-SMS verschicken
-        if (sw_sms) syslog(LOG_NOTICE, "Alarm-SMS gesendet"); //Syslog-Eintrag
-        if (sw_email) send_email(text); //Alarm-Email verschicken
-        if (sw_email) syslog(LOG_NOTICE, "Alarm-Email gesendet"); //Syslog-Eintrag
-        if (sw_blitzlicht) blitzlicht_ein(); //Blitzlicht einschalten
-        if (sw_sirene) sirene_ein(); //Sirene enschalten
-        if (sw_flurlicht) flurlicht_ein(); //Flurlicht einschalten
      }
 
      if(countdown>0) countdown--; //wenn Countdown gestartet ist, runterzählen
-     ping_watchdog(); //Hardware-Watchdog anpingen
      watchdog_zaehler++; //Watchdog-Zähler hochzählen
      if(watchdog_zaehler==watchdog_time) { //wenn 1h erreicht: Syslog-Eintrag und rücksetzen
         syslog(LOG_NOTICE, "Alarm-Daemon aktiv"); //Syslog-Eintrag
@@ -382,9 +281,12 @@ if(anlage_status[0] && !anlage_countdown[0] && !alarm_status[0] && rfid_bad) {
      alarm_countdown[0]=alarm_countdown[1];
      sleep(1); //1 sec schlafen
   } //Ende Endlosschleife
-cleanup(); //Programmende --> alles aufräumen
-return 0;
-}  /* Ende main() */
+  status_close(); //Anlagenstatus(datei) schließen
+  pthread_exit(NULL); //Alle laufenden Threads beenden
+  closelog(); //Log-Verbindung schließen
+  iniparser_freedict(config); //Ini-Parser Struktur freigeben
+  return 0;
+}  /* Ende main */
 
 
 //************************************************************************************
@@ -444,7 +346,7 @@ int hardware_init() {
     //Eingänge aus config-file initialisieren
     if(sensor_anzahl) for(i=1;i<=sensor_anzahl;i++) {
        gpio_direction(sensoren[i], IN);
-       //gpio_edge(sensoren[i], 'r');
+       gpio_edge(sensoren[i], 'r');
     }
     delay(100); //100ms warten
 
@@ -499,7 +401,7 @@ int send_sms(char sms_text[160]) {
 
 int send_email(char email_text[160]) {
    char command[1024];
-   char email_header[]="To: sven@boenischnet.de\\nFrom: Alarmanlage\\nSubject: Alarm\\n";
+   char email_header[]="To: sven.boenisch@alumni.tu-berlin.de\\nFrom: Alarmanlage\\nSubject: Alarm\\n";
 
    sprintf(command,"echo \"%s%s\" | msmtp %s &",email_header,email_text,email_addr);
    if(sim) printf("command: -->%s\n",command);
@@ -511,7 +413,7 @@ void status_init() {
 printf("Anlagenstatus-Initialisierung\n");
 fd_status = fopen(status_file,"rt+"); //Statusdatei schon da?
 if(fd_status != NULL) {
-   fscanf(fd_status,"%d",&anlage_status[0]); //alten Anlagenstatus auslesen & setzen
+   fscanf(fd_status,"%d",&anlage_status[1]); //Anlagenstatus auslesen & setzen
    rewind(fd_status); //Zeiger auf Anfang der Datei zurücksetzen
    syslog(LOG_NOTICE, "Statusdatei geöffnet");
 }
@@ -548,93 +450,35 @@ void start_threads() {
          perror("ERROR pthread_create()");
          exit(50);
       }
-      syslog(LOG_NOTICE, "Thread für RFID-Reader gestartet"); //Syslog-Eintrag
-   ret = pthread_create(&led_thread, NULL, led_out, NULL); //Thread für LED-Ausgabe
-      if(ret) {
-         perror("ERROR pthread_create()");
-         exit(50);
-      }
-      syslog(LOG_NOTICE, "Thread für LED-Ausgabe gestartet"); //Syslog-Eintrag
+      syslog(LOG_NOTICE, "RFID-Reader gestartet"); //Syslog-Eintrag
 
-   syslog(LOG_NOTICE, "%dsec Aufwärmzeit für PIR-Sensoren abwarten",sensor_warmup); //Syslog-Eintrag
-   sleep(sensor_warmup); //60sec Aufwärmzeit für PIR-Sensoren unbedingt abwarten um Fehlalarm zu vermeiden
+   sleep(pir_warmup); //Aufwärmzeit für PIR-Sensoren unbedingt abwarten um Fehlalarm zu vermeiden
    if(sensor_anzahl) for(i=1;i<=sensor_anzahl;i++) {
-      ret = pthread_create(&sensor_thread[i], NULL, pir_read, (void*)i); //Sensor-Threads
+      ret = pthread_create(&pir_thread[i], NULL, pir_read, (void*)i); //Sensor-Threads
       if(ret) {
          perror("ERROR pthread_create()");
          exit(50);
       }
-      syslog(LOG_NOTICE, "Thread für Sensor-Nr. %d an GPIO%d gestartet",i,sensoren[i]); //Syslog-Eintrag
+      syslog(LOG_NOTICE, "Sensor-Nr. %d an GPIO%d aktiviert",i,sensoren[i]); //Syslog-Eintrag
    }
    delay(100); //100ms warten
 }
 
 // Thread für PIR-Sensor Auslese
 void *pir_read(void *threadid) {
-  int index, pin, state[2];
+  int index;
   index=(int)threadid;
 
-  printf("Thread für Sensor-Nr. %d an GPIO-Pin %d gestartet\n",index,sensoren[index]);
-
-//   #0 Initialisierung der State-Machine
-  state[0]=1; //bei Zustand "Aus" starten
-  pin=0; //Pin löschen
-
-  while(1) { //Endlosschleife
-    pin = gpio_read(sensoren[index]); //Pegel am GPIO-Pin auslesen
-    //printf("pir_read(): Thread-Nr %d GPIO-Pin %d Pegel %d\n",index,sensoren[index],pin);
-
-    if(pin < 0) perror("Thread pir_read(): Error gpio_read()");
+  printf("Tread-Nr: %d --> Sensor-Nr: %d\n",index,sensoren[index]);
+  while(1) {
+    ret = gpio_wait(sensoren[index], -1); //timeout negativ --> ewig auf ereignis warten
+    if(ret < 0) perror("Thread pi_read(): Error poll()");
+    else if(ret == 0) perror("Thread pir_read(): Timeout");
     else {
-       //   #1 wenn Zustand "Aus" und Sensor High
-       if(state[0] == 1 && pin) {
-          state[1]=2; //nächster Zustand "Wird aktiviert"
-        }
-       //   #2 wenn Zustand "Aus" und Sensor Low
-       if(state[0] == 1 && !pin) {
-          state[1]=1; //nächster Zustand "Aus"
-       }
-       //   #3 wenn Zustand "Wird aktiviert" und Sensor High
-       if(state[0] == 2 && pin) {
-          state[1]=3; //nächster Zustand "Alarm"
-          printf("\033[31mpir_read(): ---> Alarm <--- Thread-Nr %d GPIO-Pin %d Pegel %d\033[m\n",index,sensoren[index],pin);
-          alarm_sensor=index; //aktivierenden Alarmsensor übergeben
-          pir_flag=1; //PIR-Sensor-Flag setzen
-          alarm_zeit=time(NULL); //Alarmzeit speichern
-        }
-       //   #4 wenn Zustand "Wird aktiviert" und Sensor Low
-       if(state[0] == 2 && !pin) {
-          state[1]=4; //nächster Zustand "Fehlalarm"
-          printf("\033[33mpir_read(): ---> Fehlalarm <--- Thread-Nr %d GPIO-Pin %d Pegel %d\033[m\n",index,sensoren[index],pin);
-          syslog(LOG_NOTICE, "Fehlalarm, Sensor: %d",index); //Syslog-Eintrag
-       }
-       //   #5 wenn Zustand "Fehlalarm" und Sensor High
-       if(state[0] == 4 && pin) {
-          state[1]=2; //nächster Zustand "Wird aktiviert"
-       }
-       //   #6 wenn Zustand "Fehlalarm" und Sensor Low
-       if(state[0] == 4 && !pin) {
-          state[1]=1; //nächster Zustand "Aus"
-       }
-       //   #7 wenn Zustand "Alarm" und Sensor High
-       if(state[0] == 3 && pin) {
-          state[1]=3; //nächster Zustand "Alarm"
-          //aber hier keine erneute Signalisierung, bevor nicht Zustand "Aus" durchlaufen wurde
-       }
-       //   #8 wenn Zustand "Alarm" und Sensor Low
-       if(state[0] == 3 && !pin) {
-          state[1]=5; //nächster Zustand "Wird deaktiviert"
-       }
-       //   #9 wenn Zustand "Wird deaktiviert" und Sensor Low
-       if(state[0] == 5 && !pin) {
-          state[1]=1; //nächster Zustand "Aus"
-       }
-       //   #10 wenn Zustand "Wird deaktiviert" und Sensor High
-       if(state[0] == 5 && pin) {
-          state[1]=3; //nächster Zustand "Alarm"
-       }
+       printf("\033[31mpir_read() Flanke detektiert! Thread-Nr: %d GPIO-Pin: %d Pegel: %d\033[m\n",index,sensoren[index],ret-1);
+       alarm_sensor=sensoren[index]; //aktivierenden Alarmsensor übergeben
+       alarm_zeit=time(NULL); //Alarmzeit speichern
     }
-  state[0]=state[1]; //aktuellen Anlagenstatus auf vorherigen Status speichern
   delay(100); //100ms warten, max. 10 Events pro sec
   }
 pthread_exit(NULL);
@@ -643,7 +487,7 @@ pthread_exit(NULL);
 //Thread für RFID-Auslese
 void *rfidd() {
 
-printf("Thread rfidd() gestartet\n");
+printf("Thread rfidd gestartet\n");
 while(1) { //nicht-blockierendes, hot-plug fähiges Auslesen des USB RFID-Readers
     while( (fd_rfid = fopen(rfid_device, "r")) == NULL) { // /dev/hidraw0 öffnen
        perror("Fehler beim Öffnen von /dev/hidraw0"); //falls Fehler
@@ -652,11 +496,8 @@ while(1) { //nicht-blockierendes, hot-plug fähiges Auslesen des USB RFID-Reader
     //printf("RFID-Tag auflegen!\n");
     res = fread(buf, 1, 176, fd_rfid); //aus datei lesen
     //if (res != 176) { perror("Fehler beim Lesen von /dev/hidraw0"); exit(1); }
-    // achtung hier wartet der prozess solange bis ein Tag aufgelegt wird
-    if (res != 176) {
-       syslog(LOG_NOTICE, "RFID-Tag Lesefehler, Tag-Nr. auf 0 setzen");
-       rfid_tag=0; //Falls Fehler beim Lesen, RFID-Tag auf 0 setzen
-    }
+    // achtung hier wartet der prozess solange bis ein Tag aufgelegt wird (also f$
+    if (res != 176) rfid_tag=0; //Falls Fehler beim Lesen, RFID-Tag auf 0 setzen
     else {
         j=9; //Zähler für 10-stellige Tag-Nr. initialisieren
         rfid_tag=0; //Tag-Nr. auf 0 (Unbekannt) initialisieren
@@ -664,8 +505,8 @@ while(1) { //nicht-blockierendes, hot-plug fähiges Auslesen des USB RFID-Reader
         for (i = 2; i < 160; i=i+16) {
            rfid_tag=rfid_tag+(pow(10,j)*((buf[i]-29)%10)); //RFID-Tag Nummer dekodieren
            j=j-1;
-        }
-        syslog(LOG_NOTICE, "RFID-Tag gelesen, Tag-Nr: %010d",rfid_tag);
+       }
+    syslog(LOG_NOTICE, "RFID-Tag gelesen, Tag-Nr: %010d",rfid_tag);
     }
     res=fclose(fd_rfid); // /dev/hidraw0 schliessen
     if (res != 0) { perror("Fehler beim Schliessen von /dev/hidraw0"); exit(1); }
@@ -681,49 +522,6 @@ while(1) { //nicht-blockierendes, hot-plug fähiges Auslesen des USB RFID-Reader
     alarm_sensor=sensor_rfid; //aktivierenden Sensor auf virtuellen RFID-Sensor setzen
     alarm_zeit=time(NULL); //Alarmzeit speichern
 }
-pthread_exit(NULL);
-}
-
-// Thread für LED-Ausgabe an GPIO
-void *led_out() {
-  int wait=1000/(2*led_freq); //1/2 Periode
-
-  printf("Thread led_out() gestartet\n");
-
-  while(1) {
-  switch(led_ok_status) {
-    case 0: gpio_write(GPIO_LED_OK, LOW); break; //LED aus
-    case 1: gpio_write(GPIO_LED_OK, HIGH); break; //LED ein
-    case 2: gpio_write(GPIO_LED_OK, HIGH); break; //LED ein
-  }
-  switch(led_active_status) {
-    case 0: gpio_write(GPIO_LED_ACTIVE, LOW); break; //LED aus
-    case 1: gpio_write(GPIO_LED_ACTIVE, HIGH); break; //LED ein
-    case 2: gpio_write(GPIO_LED_ACTIVE, HIGH); break; //LED ein
-  }
-  switch(led_alarm_status) {
-    case 0: gpio_write(GPIO_LED_ALARM, LOW); break; //LED aus
-    case 1: gpio_write(GPIO_LED_ALARM, HIGH); break; //LED ein
-    case 2: gpio_write(GPIO_LED_ALARM, HIGH); break; //LED ein
-  }
-  delay(wait); // 1/2 Periode warten
-  switch(led_ok_status) {
-    case 0: gpio_write(GPIO_LED_OK, LOW); break; //LED aus
-    case 1: gpio_write(GPIO_LED_OK, HIGH); break; //LED ein
-    case 2: gpio_write(GPIO_LED_OK, LOW); break; //LED aus
-  }
-  switch(led_active_status) {
-    case 0: gpio_write(GPIO_LED_ACTIVE, LOW); break; //LED aus
-    case 1: gpio_write(GPIO_LED_ACTIVE, HIGH); break; //LED ein
-    case 2: gpio_write(GPIO_LED_ACTIVE, LOW); break; //LED aus
-  }
-  switch(led_alarm_status) {
-    case 0: gpio_write(GPIO_LED_ALARM, LOW); break; //LED aus
-    case 1: gpio_write(GPIO_LED_ALARM, HIGH); break; //LED ein
-    case 2: gpio_write(GPIO_LED_ALARM, LOW); break; //LED aus
-  }
-  delay(wait); // 1/2 Periode warten
-  }
 pthread_exit(NULL);
 }
 
@@ -759,16 +557,12 @@ return;
 }
 
 void flurlicht_ein() {
-   gpio_write(GPIO_FLURLICHT, LOW); //Flurlicht einschalten (Impuls)
-   delay(250); //250ms warten
-   gpio_write(GPIO_FLURLICHT, HIGH);
+   gpio_write(GPIO_FLURLICHT, LOW); //Flurlicht aktivieren
 return;
 }
 
 void flurlicht_aus() {
-   gpio_write(GPIO_FLURLICHT, LOW); //Flurlicht ausschalten (Impuls)
-   delay(250); //250ms warten
-   gpio_write(GPIO_FLURLICHT, HIGH);
+   gpio_write(GPIO_FLURLICHT, HIGH); //Flurlicht deaktivieren
 return;
 }
 
@@ -790,7 +584,6 @@ void config_init() {
    sw_sirene=iniparser_getboolean(config,":horn_enable",0);
    sw_flurlicht=iniparser_getboolean(config,":light_enable",0);
    watchdog_time=iniparser_getint(config,":watchdog_time",0);
-   sensor_warmup=iniparser_getint(config,":sensor_warmup",60);
    alarm_verzoegerung=iniparser_getint(config,":alarm_verzoegerung",0);
    alarm_dauer=iniparser_getint(config,":alarm_dauer",0);
    rfid_device=iniparser_getstring(config,":rfid_device","");
@@ -815,61 +608,5 @@ void config_init() {
       sprintf(str_buf,":sensor_%d",i); //Variablennamen erzeugen
       sensoren[i]=iniparser_getint(config,str_buf,0); //Auslesen und in Array schreiben
    }
-   syslog(LOG_NOTICE, "Konfiguration aus %s gelesen",config_file);
-}
-
-void cleanup() {
-   printf("\ncleanup(): GPIO-Pins und Kameras abschalten, Aufräumen\n");
-   syslog(LOG_NOTICE, "Abschaltung durch SIGINT"); //Syslog-Eintrag
-   stop_watchdog(); //Hardware-Watchdog abschalten
-   //alle GPIO-Ausgänge abschalten
-   gpio_write(GPIO_BLITZLICHT, HIGH);
-   gpio_write(GPIO_SIRENE, HIGH);
-   gpio_write(GPIO_FLURLICHT, HIGH);
-   gpio_write(GPIO_RELAIS_4, HIGH);
-   gpio_write(GPIO_LED_OK, LOW);
-   gpio_write(GPIO_LED_ACTIVE, LOW);
-   gpio_write(GPIO_LED_ALARM, LOW);
-   syslog(LOG_NOTICE, "Alarme und LEDs abgeschaltet"); //Syslog-Eintrag
-   stop_cam(); //Kameras abschalten
-   syslog(LOG_NOTICE, "Kameras gestoppt"); //Syslog-Eintrag
-   status_close(); //Anlagenstatus(datei) schließen
-   syslog(LOG_NOTICE, "Anlagenstatus-Datei geschlossen"); //Syslog-Eintrag
-   //Alle laufenden Threads beenden
-   pthread_cancel(rfidd_thread);
-   pthread_cancel(led_thread);
-   if(sensor_anzahl) for(i=1;i<=sensor_anzahl;i++) {
-      pthread_cancel(sensor_thread[i]);
-   }
-   syslog(LOG_NOTICE, "Alle laufenden Threads beendet"); //Syslog-Eintrag
-   iniparser_freedict(config); //Ini-Parser Struktur freigeben
-   syslog(LOG_NOTICE, "Alarm-Daemon beendet");
-   closelog(); //Log-Verbindung schließen
-return;
-}
-
-void start_watchdog() {
-   wd_file=open(wd_device, O_RDWR | O_NOCTTY); //Hardware-Watchdog Device öffnen
-   if (wd_file < 0) { perror("Fehler beim Öffnen von Hardware-Watchdog"); exit(1); }
-   //printf("Hardware-Watchdog gestartet\n");
-return;
-}
-
-void stop_watchdog() {
-   write(wd_file, "V", 1); //Magisches Zeichen schreiben
-   ret=close(wd_file); //Hardware-Watchdog Device schliessen
-   if (ret < 0) { perror("Fehler beim Schliessen von Hardware-Watchdog"); exit(1); }
-   //printf("Hardware-Watchdog gestoppt\n");
-return;
-}
-
-void ping_watchdog() {
-   ioctl(wd_file, WDIOC_KEEPALIVE, 0); //Hardware-Watchdog anpingen
-return;
-}
-
-void ctrl_c_handler (int signal) {
-   //printf("\nCTRL-C gedrückt\n");
-   run=0; //Hauptschleife verlassen
-return;
+   syslog(LOG_NOTICE, "Konfiguration aus %s gelesen\n",config_file);
 }
